@@ -1,21 +1,20 @@
 /*
- * CITY LIFE 3D — NOVA BAY EDITION (V2)
- * Original mobile open-city driving and delivery game.
+ * CITY LIFE 3D — NOVA BAY MEGA WORLD (V3)
+ * Expanded mobile open-city driving, drifting and delivery game.
  * C99 + raylib 5.5 + KarvinJ/raylib-mobile Android template.
  * This project is not affiliated with Rockstar Games or GTA.
  *
- * V2 highlights:
- * - Larger procedural city with several building styles and a central plaza.
- * - Detailed low-poly buildings, storefronts, windows, balconies and rooftops.
- * - Third-person character with animated limbs, sprint and jump.
- * - Player car with enter/exit, steering, acceleration, braking and collisions.
- * - Moving traffic and walking pedestrians.
- * - Three delivery missions, cash rewards and an objective marker.
- * - Mobile virtual joystick, contextual action, jump, sprint, gas and brake.
- * - Custom title, pause screen, HUD, minimap and speed display.
+ * V3 highlights:
+ * - 16x16 procedural city grid, ~900 buildings and six distinct districts.
+ * - Airport, container harbour, waterfront, hills and expanded road network.
+ * - 32 traffic vehicles, 44 pedestrians and eight vehicle silhouettes.
+ * - Nitro, handbrake drifting, tyre smoke, skid marks and drift scoring.
+ * - Six delivery jobs, cash, garage selection and mobile driving controls.
+ * - Day/night cycle, dynamic sky, lit windows and periodic rain effects.
+ * - Three original synthesized radio loops and a synthesized engine loop.
  *
- * All world art is procedurally drawn from raylib primitives. No external
- * model, texture or audio files are required for this build.
+ * All art/audio is generated procedurally. This is not photorealistic AAA art;
+ * imported high-detail models, PBR materials and recorded music are not included.
  */
 
 #include "raymob.h"
@@ -24,17 +23,20 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 #define PI_F                 3.14159265358979323846f
 #define RAD_TO_DEG           57.29577951308232f
-#define CITY_HALF            192.0f
+#define CITY_HALF            384.0f
 #define CITY_BLOCK           48.0f
-#define CITY_ROAD_COUNT      9
-#define MAX_BUILDINGS        256
-#define WALKER_COUNT         22
-#define TRAFFIC_COUNT        12
-#define MISSION_COUNT        6
-#define DRAW_DISTANCE        158.0f
+#define CITY_ROAD_COUNT      17
+#define MAX_BUILDINGS        1040
+#define WALKER_COUNT         44
+#define TRAFFIC_COUNT        32
+#define MISSION_COUNT        12
+#define DRAW_DISTANCE        214.0f
+#define SMOKE_COUNT          48
+#define SKID_COUNT           160
 #define PLAYER_RADIUS        0.62f
 #define CAR_RADIUS           1.55f
 
@@ -98,6 +100,20 @@ typedef struct {
     float y;
 } MoveInput;
 
+typedef struct {
+    Vector3 position;
+    Vector3 velocity;
+    float life;
+    float maxLife;
+    float size;
+} SmokeParticle;
+
+typedef struct {
+    Vector3 a;
+    Vector3 b;
+    float life;
+} SkidMark;
+
 typedef enum {
     GAME_TITLE = 0,
     GAME_PLAYING,
@@ -109,6 +125,20 @@ static Building gBuildings[MAX_BUILDINGS];
 static int gBuildingCount = 0;
 static Pedestrian gPedestrians[WALKER_COUNT];
 static Vehicle gTraffic[TRAFFIC_COUNT];
+static SmokeParticle gSmoke[SMOKE_COUNT];
+static SkidMark gSkids[SKID_COUNT];
+static int gSmokeCursor = 0;
+static int gSkidCursor = 0;
+static float gSmokeSpawnTimer = 0.0f;
+static float gNightAmount = 0.0f;
+static float gDriftScore = 0.0f;
+static int gBestDrift = 0;
+static bool gRadioEnabled = true;
+static bool gAudioReady = false;
+static bool gAudioDeviceReady = false;
+static Sound gRadioSounds[3] = {{0}};
+static int gRadioIndex = 0;
+static Sound gEngineSound = {0};
 
 /* ---- Small helpers ----------------------------------------------------- */
 static float ClampF(float v, float lo, float hi) {
@@ -139,6 +169,15 @@ static Color ColorScale(Color c, float factor) {
     out.g = (unsigned char)ClampF((float)c.g*factor, 0.0f, 255.0f);
     out.b = (unsigned char)ClampF((float)c.b*factor, 0.0f, 255.0f);
     return out;
+}
+
+static Color LerpColor(Color a, Color b, float t) {
+    t = ClampF(t, 0.0f, 1.0f);
+    return (Color){
+        (unsigned char)LerpF((float)a.r, (float)b.r, t),
+        (unsigned char)LerpF((float)a.g, (float)b.g, t),
+        (unsigned char)LerpF((float)a.b, (float)b.b, t), 255
+    };
 }
 
 static unsigned int Hash2(int a, int b, int c) {
@@ -222,10 +261,13 @@ static void AddBuilding(float x, float z, float w, float d, float h,
 static void BuildCity(void) {
     gBuildingCount = 0;
 
-    /* Eight by eight city blocks; the centre block becomes a public plaza. */
-    for (int bx = -4; bx < 4; bx++) {
-        for (int bz = -4; bz < 4; bz++) {
+    /* Sixteen by sixteen blocks, split into distinct urban districts.
+       A western corridor is reserved for the airport runway and terminal. */
+    for (int bx = -8; bx < 8; bx++) {
+        for (int bz = -8; bz < 8; bz++) {
             if (bx == 0 && bz == 0) continue;
+            if (bx <= -6 && bz >= -3 && bz <= 2) continue;
+            if (bx >= 4 && bz <= -6) continue; /* container harbour district */
 
             float cx = (float)bx*CITY_BLOCK + CITY_BLOCK*0.5f;
             float cz = (float)bz*CITY_BLOCK + CITY_BLOCK*0.5f;
@@ -235,8 +277,13 @@ static void BuildCity(void) {
                     unsigned int seed = Hash2(bx, bz, (sx+2)*5 + (sz+2));
                     int style = (int)(seed % 4u);
                     float h = 13.0f + (float)((seed >> 5) % 8u)*3.1f;
+                    /* Downtown towers; industrial and old-town buildings stay lower. */
+                    if (abs(bx) <= 2 && abs(bz) <= 2) h += 24.0f;
+                    else if (bx >= 4) h = 9.0f + (float)((seed >> 8) % 5u)*1.8f;
+                    else if (bz >= 4) h = 10.0f + (float)((seed >> 9) % 6u)*2.0f;
                     if (style == 2) h += 12.0f;
                     if (style == 3) h = 10.0f + (float)((seed >> 9) % 4u)*2.0f;
+                    if (h > 82.0f) h = 82.0f;
                     float width = 11.5f + (float)((seed >> 12) % 4u)*0.75f;
                     float depth = 11.5f + (float)((seed >> 15) % 4u)*0.75f;
                     AddBuilding(cx + (float)sx*9.0f,
@@ -271,18 +318,18 @@ static void MoveWithCollision(Vector3 *p, float dx, float dz, float radius) {
 }
 
 /* ---- World rendering --------------------------------------------------- */
-static void DrawRoadNetwork(void) {
+static void DrawRoadNetwork(Vector3 focus) {
     /* City ground. */
     DrawPlane((Vector3){0.0f, -0.12f, 0.0f},
-              (Vector2){430.0f, 430.0f}, C_GRASS);
+              (Vector2){850.0f, 850.0f}, C_GRASS);
 
-    /* A small waterfront beyond the north end of the city. */
-    DrawCube((Vector3){0.0f, -0.08f, -224.0f},
-             430.0f, 0.12f, 72.0f, (Color){ 65, 151, 190, 255 });
-    DrawCube((Vector3){0.0f, -0.01f, -188.0f},
-             430.0f, 0.14f, 5.0f, (Color){ 222, 196, 145, 255 });
-    DrawCube((Vector3){0.0f, 0.025f, -180.0f},
-             430.0f, 0.11f, 2.0f, C_SIDEWALK);
+    /* Ocean, beaches and a long coastal promenade north of the city. */
+    DrawCube((Vector3){0.0f, -0.08f, -438.0f},
+             860.0f, 0.12f, 122.0f, (Color){ 41, 126, 169, 255 });
+    DrawCube((Vector3){0.0f, -0.01f, -377.0f},
+             860.0f, 0.14f, 8.0f, (Color){ 224, 198, 153, 255 });
+    DrawCube((Vector3){0.0f, 0.025f, -366.0f},
+             860.0f, 0.11f, 3.0f, C_SIDEWALK);
 
     for (int i = 0; i < CITY_ROAD_COUNT; i++) {
         float c = -CITY_HALF + (float)i*CITY_BLOCK;
@@ -290,26 +337,30 @@ static void DrawRoadNetwork(void) {
         float sidewalk = 3.0f;
 
         /* Road surfaces. */
-        DrawCube((Vector3){c, 0.0f, 0.0f}, width, 0.12f, 410.0f, C_ROAD);
-        DrawCube((Vector3){0.0f, 0.0f, c}, 410.0f, 0.12f, width, C_ROAD);
+        DrawCube((Vector3){c, 0.0f, 0.0f}, width, 0.12f, 820.0f, C_ROAD);
+        DrawCube((Vector3){0.0f, 0.0f, c}, 820.0f, 0.12f, width, C_ROAD);
 
         /* Road shoulders and sidewalks on both sides. */
         for (int side = -1; side <= 1; side += 2) {
             float offset = (width*0.5f) + sidewalk*0.5f;
             DrawCube((Vector3){c + (float)side*offset, 0.015f, 0.0f},
-                     sidewalk, 0.15f, 410.0f, C_SIDEWALK);
+                     sidewalk, 0.15f, 820.0f, C_SIDEWALK);
             DrawCube((Vector3){0.0f, 0.015f, c + (float)side*offset},
-                     410.0f, 0.15f, sidewalk, C_SIDEWALK);
+                     820.0f, 0.15f, sidewalk, C_SIDEWALK);
             DrawCube((Vector3){c + (float)side*(width*0.5f + sidewalk), 0.10f, 0.0f},
-                     0.22f, 0.18f, 410.0f, C_CURB);
+                     0.22f, 0.18f, 820.0f, C_CURB);
             DrawCube((Vector3){0.0f, 0.10f, c + (float)side*(width*0.5f + sidewalk)},
-                     410.0f, 0.18f, 0.22f, C_CURB);
+                     820.0f, 0.18f, 0.22f, C_CURB);
         }
 
         /* Broken centre lines. */
-        for (int m = -190; m <= 190; m += 18) {
-            DrawCube((Vector3){c, 0.075f, (float)m}, 0.20f, 0.025f, 7.0f, C_LANE);
-            DrawCube((Vector3){(float)m, 0.075f, c}, 7.0f, 0.025f, 0.20f, C_LANE);
+        for (int m = -380; m <= 380; m += 18) {
+            if (fabsf((float)m - focus.z) < DRAW_DISTANCE) {
+                DrawCube((Vector3){c, 0.075f, (float)m}, 0.20f, 0.025f, 7.0f, C_LANE);
+            }
+            if (fabsf((float)m - focus.x) < DRAW_DISTANCE) {
+                DrawCube((Vector3){(float)m, 0.075f, c}, 7.0f, 0.025f, 0.20f, C_LANE);
+            }
         }
     }
 
@@ -324,18 +375,20 @@ static void DrawRoadNetwork(void) {
 }
 
 static void DrawBuildingWindows(const Building *b, float distance) {
-    if (distance > DRAW_DISTANCE) return;
+    /* Distance-based detail keeps the expanded world practical on phones. */
+    if (distance > 145.0f) return;
 
     int floors = (int)(b->height/3.25f);
     if (floors < 2) floors = 2;
-    if (floors > 10) floors = 10;
+    int floorLimit = (distance > 92.0f) ? 5 : 10;
+    if (floors > floorLimit) floors = floorLimit;
 
     float windowY;
     float windowW = (b->style == 2) ? 1.55f : 1.35f;
     float windowH = (b->style == 2) ? 1.55f : 1.25f;
     float sideOffset = b->width*0.5f + 0.055f;
     float frontOffset = b->depth*0.5f + 0.055f;
-    int columns = (b->width > 13.0f) ? 3 : 2;
+    int columns = (distance > 92.0f) ? 2 : ((b->width > 13.0f) ? 3 : 2);
 
     for (int f = 0; f < floors; f++) {
         windowY = 2.1f + (float)f*3.05f;
@@ -346,13 +399,13 @@ static void DrawBuildingWindows(const Building *b, float distance) {
             float z1 = b->position.z + frontOffset;
             float z2 = b->position.z - frontOffset;
             unsigned int lit = Hash2((int)b->position.x + col, (int)b->position.z + f, b->style);
-            Color glass = ((lit % 7u) == 0u) ? C_WINDOW_LIT : C_WINDOW;
+            Color glass = (gNightAmount > 0.34f || (lit % 7u) == 0u) ? C_WINDOW_LIT : C_WINDOW;
             DrawCube((Vector3){x, windowY, z1}, windowW, windowH, 0.09f, glass);
             DrawCube((Vector3){x, windowY, z2}, windowW, windowH, 0.09f, glass);
         }
 
         /* Side windows on glass and office buildings. */
-        if (b->style == 1 || b->style == 2) {
+        if (distance < 92.0f && (b->style == 1 || b->style == 2)) {
             for (int col = -1; col <= 1; col += 2) {
                 float z = b->position.z + (float)col*2.5f;
                 DrawCube((Vector3){b->position.x + sideOffset, windowY, z},
@@ -396,7 +449,7 @@ static void DrawBuilding(const Building *b, Vector3 focus) {
     }
 
     /* Small balconies on selected residential towers. */
-    if (b->style == 0 || b->style == 1) {
+    if (distance < 115.0f && (b->style == 0 || b->style == 1)) {
         for (int f = 1; f < 4; f++) {
             float y = 2.7f + (float)f*6.0f;
             if (y < b->height - 2.0f && ((b->seed >> (unsigned int)f) & 1u)) {
@@ -441,6 +494,10 @@ static void DrawStreetLamp(float x, float z) {
              (Color){ 63, 72, 82, 255 });
     DrawCube((Vector3){x + 1.23f, 6.05f, z}, 0.52f, 0.18f, 0.52f,
              (Color){ 244, 218, 151, 255 });
+    if (gNightAmount > 0.25f) {
+        DrawSphere((Vector3){x + 1.23f, 5.95f, z}, 0.48f,
+                   Fade((Color){255, 220, 145, 255}, gNightAmount*0.30f));
+    }
 }
 
 static void DrawCentralPlaza(float time) {
@@ -477,15 +534,90 @@ static void DrawCentralPlaza(float time) {
     DrawTree(38.0f, 38.0f, 0.92f);
 }
 
+/* ---- Large-world landmarks -------------------------------------------- */
+static void DrawAirport(Vector3 focus) {
+    if (Distance2D(focus.x, focus.z, -330.0f, 0.0f) > DRAW_DISTANCE + 80.0f) return;
+    DrawCube((Vector3){-330.0f, 0.025f, 0.0f}, 25.0f, 0.18f, 224.0f,
+             (Color){ 48, 53, 62, 255 });
+    DrawCube((Vector3){-330.0f, 0.13f, 0.0f}, 0.55f, 0.035f, 198.0f, C_WHITE);
+    for (int z = -92; z <= 92; z += 24) {
+        DrawCube((Vector3){-330.0f, 0.15f, (float)z}, 10.0f, 0.035f, 1.1f, C_WHITE);
+    }
+    /* Terminal and control tower. */
+    DrawCube((Vector3){-292.0f, 5.0f, -82.0f}, 44.0f, 10.0f, 25.0f,
+             (Color){ 174, 190, 197, 255 });
+    DrawCube((Vector3){-292.0f, 9.0f, -68.8f}, 38.0f, 2.0f, 1.0f, C_WINDOW);
+    DrawCube((Vector3){-270.0f, 17.0f, -76.0f}, 7.0f, 24.0f, 7.0f,
+             (Color){ 125, 145, 155, 255 });
+    DrawCube((Vector3){-270.0f, 30.0f, -76.0f}, 9.0f, 4.0f, 9.0f, C_GLASS_DARK);
+    DrawCube((Vector3){-270.0f, 33.0f, -76.0f}, 4.0f, 0.35f, 4.0f, C_RED);
+    /* Parked passenger aircraft, stylised from primitives. */
+    DrawCylinderEx((Vector3){-330.0f, 3.1f, 0.0f},
+                   (Vector3){-330.0f, 3.1f, -20.0f}, 1.7f, 1.7f, 12, C_WHITE);
+    DrawCube((Vector3){-330.0f, 3.3f, -6.0f}, 30.0f, 0.28f, 7.5f, C_WHITE);
+    DrawCube((Vector3){-330.0f, 3.3f, 1.0f}, 9.0f, 0.18f, 5.0f, C_WHITE);
+    DrawCube((Vector3){-330.0f, 3.4f, -12.0f}, 4.8f, 0.18f, 8.5f, C_WHITE);
+    DrawCube((Vector3){-330.0f, 4.3f, -9.0f}, 4.2f, 1.0f, 4.6f, C_GLASS_DARK);
+}
+
+static void DrawHarbor(Vector3 focus, float time) {
+    if (Distance2D(focus.x, focus.z, 270.0f, -332.0f) > DRAW_DISTANCE + 100.0f) return;
+    DrawCube((Vector3){270.0f, 0.02f, -352.0f}, 190.0f, 0.28f, 38.0f,
+             (Color){ 112, 117, 118, 255 });
+    for (int i = 0; i < 12; i++) {
+        float x = 190.0f + (float)(i%4)*23.0f;
+        float z = -338.0f - (float)(i/4)*12.0f;
+        Color c = (i%3 == 0) ? (Color){190, 91, 61, 255} :
+                  ((i%3 == 1) ? (Color){58, 112, 145, 255} : (Color){190, 157, 73, 255});
+        DrawCube((Vector3){x, 3.0f, z}, 19.0f, 6.0f, 10.0f, c);
+        DrawCube((Vector3){x, 6.2f, z}, 19.2f, 0.16f, 10.2f, ColorScale(c, 0.72f));
+    }
+    DrawCube((Vector3){270.0f, 0.25f, -392.0f}, 180.0f, 0.55f, 50.0f,
+             (Color){ 100, 103, 101, 255 });
+    for (int i = 0; i < 5; i++) {
+        float x = 205.0f + (float)i*32.0f;
+        DrawCylinder((Vector3){x, 6.0f, -370.0f}, 0.45f, 0.45f, 12.0f, 8,
+                     (Color){ 53, 64, 73, 255 });
+        DrawLine3D((Vector3){x, 12.0f, -370.0f},
+                   (Vector3){x + 5.0f*sinf(time*0.2f), 20.0f, -365.0f}, C_GOLD);
+    }
+}
+
+static void DrawWorldLandmarks(Vector3 focus, float time) {
+    DrawAirport(focus);
+    DrawHarbor(focus, time);
+    /* Distant low-poly hills give the outer districts a defined skyline. */
+    if (focus.z > 170.0f) {
+        for (int i = 0; i < 9; i++) {
+            float x = -370.0f + (float)i*92.0f;
+            float h = 38.0f + (float)((i*17)%43);
+            DrawCylinder((Vector3){x, h*0.40f, 440.0f}, 38.0f, 10.0f, h, 7,
+                         (Color){ 92, 112, 91, 255 });
+        }
+    }
+}
+
+static const char *GetDistrictName(Vector3 p) {
+    if (p.x < -270.0f && p.z > -170.0f && p.z < 170.0f) return "NOVA INTERNATIONAL AIRPORT";
+    if (p.x > 170.0f && p.z < -275.0f) return "NOVA CONTAINER PORT";
+    if (p.z < -250.0f) return "OCEAN BAY / COASTLINE";
+    if (fabsf(p.x) < 120.0f && fabsf(p.z) < 120.0f) return "NOVA DOWNTOWN";
+    if (p.x > 180.0f) return "INDUSTRIAL DISTRICT";
+    if (p.z > 190.0f) return "OLD TOWN / RESIDENTIAL";
+    if (p.x < -180.0f) return "WESTSIDE SUBURBS";
+    return "NOVA BAY METROPOLIS";
+}
+
 /* ---- Vehicles ---------------------------------------------------------- */
 static void DrawVehicleModel(const Vehicle *v, bool playerVehicle) {
     rlPushMatrix();
     rlTranslatef(v->position.x, v->position.y, v->position.z);
     rlRotatef(v->yaw*RAD_TO_DEG, 0.0f, 1.0f, 0.0f);
 
-    float bodyY = (v->model == 1) ? 0.82f : 0.78f;
-    float bodyW = (v->model == 1) ? 2.18f : 1.92f;
-    float bodyL = (v->model == 1) ? 4.65f : 4.05f;
+    float bodyY = (v->model == 1 || v->model == 6) ? 0.72f :
+                  ((v->model == 2 || v->model == 4 || v->model == 5) ? 0.96f : 0.80f);
+    float bodyW = (v->model == 1 || v->model == 3 || v->model == 4 || v->model == 5) ? 2.18f : 1.94f;
+    float bodyL = (v->model == 1 || v->model == 3 || v->model == 4 || v->model == 5) ? 4.95f : 4.22f;
     Color paint = v->paint;
     Color glass = (Color){ 65, 121, 151, 255 };
 
@@ -499,8 +631,12 @@ static void DrawVehicleModel(const Vehicle *v, bool playerVehicle) {
              ColorScale(paint, 0.88f));
 
     /* Cabin and windows. */
-    DrawCube((Vector3){0.0f, 1.47f, 0.24f}, bodyW*0.78f, 0.82f, 2.0f,
-             ColorScale(paint, 0.94f));
+    float cabinHeight = (v->model == 1 || v->model == 6) ? 0.56f :
+                        ((v->model == 2 || v->model == 4 || v->model == 5) ? 1.02f : 0.82f);
+    float cabinY = (v->model == 1 || v->model == 6) ? 1.34f :
+                   ((v->model == 2 || v->model == 4 || v->model == 5) ? 1.55f : 1.47f);
+    DrawCube((Vector3){0.0f, cabinY, 0.24f}, bodyW*0.78f, cabinHeight,
+             (v->model == 3 || v->model == 5) ? 1.42f : 2.0f, ColorScale(paint, 0.94f));
     DrawCube((Vector3){0.0f, 1.52f, -0.79f}, bodyW*0.72f, 0.58f, 0.08f, glass);
     DrawCube((Vector3){0.0f, 1.52f, 1.27f}, bodyW*0.70f, 0.55f, 0.08f, glass);
     DrawCube((Vector3){-bodyW*0.405f, 1.51f, 0.20f}, 0.08f, 0.58f, 1.45f, glass);
@@ -532,6 +668,29 @@ static void DrawVehicleModel(const Vehicle *v, bool playerVehicle) {
         }
     }
 
+    /* Model-specific silhouettes: sport rear wing, SUV roof rack, pickup bed. */
+    if (v->model == 1) {
+        DrawCube((Vector3){0.0f, 1.48f, 1.72f}, 1.75f, 0.10f, 0.22f, C_DARK);
+        DrawCube((Vector3){0.0f, 1.30f, 1.70f}, 0.10f, 0.36f, 0.14f, C_DARK);
+    } else if (v->model == 2) {
+        DrawCube((Vector3){0.0f, 2.12f, 0.20f}, 1.55f, 0.08f, 1.60f, C_DARK);
+    } else if (v->model == 3) {
+        DrawCube((Vector3){0.0f, 1.18f, 1.16f}, bodyW*0.78f, 0.48f, 1.02f,
+                 ColorScale(paint, 0.76f));
+    } else if (v->model == 4) {
+        DrawCube((Vector3){0.0f, 2.12f, 0.10f}, 0.70f, 0.12f, 0.42f, C_WHITE);
+        DrawCube((Vector3){-0.34f, 2.24f, 0.10f}, 0.22f, 0.12f, 0.32f, C_BLUE);
+        DrawCube((Vector3){0.34f, 2.24f, 0.10f}, 0.22f, 0.12f, 0.32f, C_RED);
+    } else if (v->model == 5) {
+        DrawCube((Vector3){0.0f, 1.28f, 1.23f}, 1.72f, 0.82f, 1.28f, ColorScale(paint, 0.88f));
+        DrawCube((Vector3){0.0f, 1.88f, 0.22f}, 1.50f, 0.20f, 1.55f, glass);
+    } else if (v->model == 6) {
+        DrawCube((Vector3){0.0f, 1.10f, 0.22f}, bodyW*0.72f, 0.12f, 2.00f, C_GOLD);
+        DrawCube((Vector3){0.0f, 1.72f, 0.10f}, bodyW*0.74f, 0.12f, 1.65f, C_DARK);
+    } else if (v->model == 7) {
+        DrawCube((Vector3){0.0f, 2.05f, 0.12f}, 0.44f, 0.14f, 0.34f, C_GOLD);
+        DrawCube((Vector3){0.0f, 0.91f, 0.0f}, bodyW*0.97f, 0.07f, bodyL*0.82f, C_WHITE);
+    }
     if (playerVehicle) {
         DrawCube((Vector3){0.0f, 1.91f, -0.15f}, 0.18f, 0.08f, 0.32f,
                  (Color){ 235, 235, 235, 255 });
@@ -548,19 +707,19 @@ static void InitTraffic(void) {
 
     for (int i = 0; i < TRAFFIC_COUNT; i++) {
         Vehicle *v = &gTraffic[i];
-        int road = (i%5) - 2;
+        int road = (i%15) - 7;
         float coord = (float)road*48.0f;
-        v->speed = 5.0f + (float)(i%4)*1.35f;
+        v->speed = 6.0f + (float)(i%5)*1.55f;
         v->paint = paints[i%6];
-        v->model = i%3;
+        v->model = i%8;
         v->position.y = 0.0f;
         if ((i%2) == 0) {
-            v->position.x = -170.0f + (float)i*25.0f;
+            v->position.x = -CITY_HALF + 16.0f + (float)((i*73)%((int)(CITY_HALF*2.0f - 32.0f)));
             v->position.z = coord + ((i%4 < 2) ? -3.2f : 3.2f);
             v->yaw = (i%4 < 2) ? -PI_F*0.5f : PI_F*0.5f;
         } else {
             v->position.x = coord + ((i%4 < 2) ? -3.2f : 3.2f);
-            v->position.z = -170.0f + (float)i*25.0f;
+            v->position.z = -CITY_HALF + 16.0f + (float)((i*59)%((int)(CITY_HALF*2.0f - 32.0f)));
             v->yaw = (i%4 < 2) ? 0.0f : PI_F;
         }
     }
@@ -658,8 +817,8 @@ static void InitPedestrians(void) {
         Pedestrian *p = &gPedestrians[i];
         p->alongX = ((i%2) == 0);
         p->direction = ((i%3) == 0) ? -1 : 1;
-        p->routeMin = -180.0f;
-        p->routeMax = 180.0f;
+        p->routeMin = -CITY_HALF + 24.0f;
+        p->routeMax = CITY_HALF - 24.0f;
         p->speed = 1.0f + (float)(i%5)*0.27f;
         p->phase = (float)i*0.83f;
         p->shirt = shirts[i%7];
@@ -671,16 +830,16 @@ static void InitPedestrians(void) {
         };
 
         if (p->alongX) {
-            int road = (i/2)%7 - 3;
-            p->position = (Vector3){ -160.0f + (float)i*13.0f,
-                                     0.0f,
+            int road = (i/2)%15 - 7;
+            float start = -CITY_HALF + 30.0f + (float)((i*41)%((int)(CITY_HALF*2.0f - 60.0f)));
+            p->position = (Vector3){ start, 0.0f,
                                      (float)road*48.0f + ((i%4 < 2) ? -10.2f : 10.2f) };
             p->yaw = (p->direction > 0) ? -PI_F*0.5f : PI_F*0.5f;
         } else {
-            int road = (i/2)%7 - 3;
+            int road = (i/2)%15 - 7;
+            float start = -CITY_HALF + 30.0f + (float)((i*37)%((int)(CITY_HALF*2.0f - 60.0f)));
             p->position = (Vector3){ (float)road*48.0f + ((i%4 < 2) ? -10.2f : 10.2f),
-                                     0.0f,
-                                     -160.0f + (float)i*13.0f };
+                                     0.0f, start };
             p->yaw = (p->direction > 0) ? PI_F : 0.0f;
         }
     }
@@ -705,14 +864,31 @@ static void UpdatePedestrians(float dt) {
     }
 }
 
+static void DrawRainAround(Vector3 focus, float time, bool raining) {
+    if (!raining) return;
+    for (int i = 0; i < 72; i++) {
+        float x = focus.x + (float)((i*37)%74) - 37.0f;
+        float z = focus.z + (float)((i*53)%74) - 37.0f;
+        float y = 5.0f + (float)((i*19)%17) + fmodf(time*29.0f + (float)i*1.7f, 8.0f);
+        DrawLine3D((Vector3){x, y, z}, (Vector3){x - 0.30f, y - 1.25f, z + 0.10f},
+                   Fade((Color){190, 212, 225, 255}, 0.48f));
+    }
+}
+
+static const char *GetCarName(int model) {
+    static const char *names[8] = {"CITY SEDAN", "SPORT COUPE", "OFFROAD SUV", "PICKUP",
+                                  "POLICE UNIT", "CARGO VAN", "CLASSIC GT", "CITY TAXI"};
+    return names[model%8];
+}
+
 /* ---- Missions ---------------------------------------------------------- */
 static const Vector3 gMissionPoints[MISSION_COUNT] = {
-    {  45.0f, 0.0f,  11.0f },
-    {  98.0f, 0.0f, -48.0f },
-    { -44.0f, 0.0f,  60.0f },
-    { -96.0f, 0.0f, -52.0f },
-    { 145.0f, 0.0f, -105.0f },
-    { -145.0f, 0.0f, 144.0f }
+    {   45.0f, 0.0f,   11.0f }, {   98.0f, 0.0f,  -48.0f },
+    {  -44.0f, 0.0f,   60.0f }, {  -96.0f, 0.0f,  -52.0f },
+    {  145.0f, 0.0f, -105.0f }, { -145.0f, 0.0f,  144.0f },
+    {  285.0f, 0.0f,  -90.0f }, { -286.0f, 0.0f, -150.0f },
+    {  250.0f, 0.0f,  240.0f }, { -240.0f, 0.0f,  285.0f },
+    {   10.0f, 0.0f, -330.0f }, { -330.0f, 0.0f,    0.0f }
 };
 
 static void DrawMissionMarker(Vector3 p, float time, bool pickup) {
@@ -763,19 +939,33 @@ static void DrawGameHUD(int screenW, int screenH, int cash,
                         bool inCar, bool nearCar, bool nearMission,
                         Vector3 actor, Vector3 target, bool hasTarget,
                         MoveInput stick, float stickX, float stickY,
-                        float time) {
-    DrawPanel((Rectangle){14.0f, 14.0f, 290.0f, 112.0f}, C_HUD, (Color){ 111, 142, 160, 220 });
-    DrawText("NOVA BAY", 28, 23, 16, C_MINT);
-    DrawText("CITY LIFE 3D", 28, 44, 25, C_WHITE);
-    DrawText(TextFormat("CASH  $%d", cash), 28, 79, 18, C_GOLD);
-    DrawText(TextFormat("DELIVERIES  %d / 3", delivered), 28, 103, 14, C_WHITE);
+                        float time, bool radioEnabled, int radioTrack, int carModel,
+                        float driftScore, int bestDrift, float nightAmount, bool raining) {
+    DrawPanel((Rectangle){14.0f, 14.0f, 290.0f, 128.0f}, C_HUD, (Color){ 111, 142, 160, 220 });
+    DrawText("NOVA BAY", 28, 21, 15, C_MINT);
+    DrawText("CITY LIFE 3D", 28, 40, 23, C_WHITE);
+    DrawText(GetDistrictName(actor), 28, 68, 12, Fade(C_WHITE, 0.84f));
+    DrawText(TextFormat("CASH  $%d", cash), 28, 88, 17, C_GOLD);
+    DrawText(TextFormat("DELIVERIES  %d / 6", delivered), 28, 113, 13, C_WHITE);
 
     Rectangle map = {(float)screenW - 160.0f, 14.0f, 146.0f, 146.0f};
     DrawMinimap(map, actor, target, hasTarget, inCar);
 
     DrawPanel((Rectangle){(float)screenW - 160.0f, 169.0f, 146.0f, 42.0f}, C_HUD, Fade(C_WHITE, 0.30f));
-    DrawText(inCar ? TextFormat("SPEED  %03d", (int)fabsf(speed)) : "ON FOOT",
-             screenW - 147, 181, 16, C_WHITE);
+    DrawText(inCar ? TextFormat("SPEED  %03d KM/H", (int)(fabsf(speed)*4.0f)) : "ON FOOT",
+             screenW - 147, 181, 14, C_WHITE);
+    DrawText(TextFormat("DRIFT %05d  BEST %05d", (int)driftScore, bestDrift),
+             screenW - 147, 197, 9, C_GOLD);
+    DrawPanel((Rectangle){(float)screenW - 160.0f, 216.0f, 146.0f, 38.0f},
+              (Color){ 12, 20, 31, 220 }, Fade(C_MINT, 0.35f));
+    const char *radioName = (radioTrack == 0) ? "NOVA DRIFT" : ((radioTrack == 1) ? "NIGHT CRUISE" : "COASTLINE FM");
+    DrawText(radioEnabled ? TextFormat("FM  %s", radioName) : "NOVA FM  OFF", screenW - 147, 228, 12,
+             radioEnabled ? C_MINT : C_RED);
+    DrawPanel((Rectangle){(float)screenW - 160.0f, 260.0f, 146.0f, 38.0f},
+              (Color){ 12, 20, 31, 220 }, Fade(C_GOLD, 0.35f));
+    DrawText(GetCarName(carModel), screenW - 147, 271, 12, C_GOLD);
+    DrawText(raining ? "WEATHER  RAIN" : (nightAmount > 0.55f ? "WEATHER  NIGHT" : "WEATHER  CLEAR"),
+             screenW - 147, 289, 9, Fade(C_WHITE, 0.78f));
 
     /* Mission hint. */
     if (missionStep < MISSION_COUNT) {
@@ -802,6 +992,7 @@ static void DrawGameHUD(int screenW, int screenH, int cash,
     Rectangle gasRect = {(float)screenW - 112.0f, (float)screenH - 144.0f, 94.0f, 82.0f};
     Rectangle brakeRect = {(float)screenW - 218.0f, (float)screenH - 132.0f, 94.0f, 72.0f};
     Rectangle sprintRect = {18.0f, (float)screenH - 118.0f, 90.0f, 48.0f};
+    Rectangle driftRect = {(float)screenW - 218.0f, (float)screenH - 216.0f, 94.0f, 56.0f};
 
     const char *actionLabel = inCar ? "EXIT CAR" : (nearCar ? "ENTER CAR" : (nearMission ? "INTERACT" : "ACTION"));
     DrawButton(actionRect, actionLabel, C_BLUE, nearCar || nearMission);
@@ -809,17 +1000,166 @@ static void DrawGameHUD(int screenW, int screenH, int cash,
     else DrawButton(jumpRect, "CAMERA", (Color){ 65, 90, 120, 255 }, false);
     DrawButton(gasRect, "GAS", (Color){ 34, 139, 91, 255 }, false);
     DrawButton(brakeRect, "BRAKE", (Color){ 163, 68, 64, 255 }, false);
-    if (!inCar) DrawButton(sprintRect, "SPRINT", (Color){ 121, 94, 164, 255 }, false);
+    DrawButton(sprintRect, inCar ? "NITRO" : "SPRINT", (Color){ 121, 94, 164, 255 }, false);
+    if (inCar) DrawButton(driftRect, "HANDBRAKE", (Color){ 169, 104, 49, 255 }, false);
 
     DrawText("LEFT STICK  MOVE / STEER", 16, screenH - 24, 13, Fade(C_WHITE, 0.86f));
     (void)time;
 }
 
+/* ---- Drift, tyre smoke and original radio ------------------------------ */
+static void SpawnDriftEffects(const Vehicle *car) {
+    for (int side = -1; side <= 1; side += 2) {
+        float localX = (float)side*0.88f;
+        float localZ = 1.48f;
+        float wx = car->position.x + cosf(car->yaw)*localX + sinf(car->yaw)*localZ;
+        float wz = car->position.z - sinf(car->yaw)*localX + cosf(car->yaw)*localZ;
+        SmokeParticle *p = &gSmoke[gSmokeCursor++ % SMOKE_COUNT];
+        p->position = (Vector3){wx, 0.38f, wz};
+        p->velocity = (Vector3){(float)side*0.35f, 0.72f, 0.0f};
+        p->life = 0.95f;
+        p->maxLife = 0.95f;
+        p->size = 0.32f;
+        SkidMark *m = &gSkids[gSkidCursor++ % SKID_COUNT];
+        m->a = (Vector3){wx - 0.18f, 0.12f, wz};
+        m->b = (Vector3){wx + 0.18f, 0.12f, wz};
+        m->life = 13.0f;
+    }
+}
+
+static void UpdateDriftEffects(float dt) {
+    for (int i = 0; i < SMOKE_COUNT; i++) {
+        SmokeParticle *p = &gSmoke[i];
+        if (p->life <= 0.0f) continue;
+        p->life -= dt;
+        p->position.x += p->velocity.x*dt;
+        p->position.y += p->velocity.y*dt;
+        p->position.z += p->velocity.z*dt;
+        p->size += dt*0.28f;
+    }
+    for (int i = 0; i < SKID_COUNT; i++) {
+        if (gSkids[i].life > 0.0f) gSkids[i].life -= dt;
+    }
+}
+
+static void DrawDriftEffects(void) {
+    for (int i = 0; i < SKID_COUNT; i++) {
+        if (gSkids[i].life > 0.0f) {
+            float alpha = ClampF(gSkids[i].life/13.0f, 0.0f, 0.45f);
+            DrawLine3D(gSkids[i].a, gSkids[i].b, Fade((Color){22, 25, 29, 255}, alpha));
+        }
+    }
+    for (int i = 0; i < SMOKE_COUNT; i++) {
+        SmokeParticle *p = &gSmoke[i];
+        if (p->life > 0.0f) {
+            float alpha = ClampF(p->life/p->maxLife, 0.0f, 1.0f)*0.34f;
+            DrawSphere(p->position, p->size, Fade((Color){191, 199, 205, 255}, alpha));
+        }
+    }
+}
+
+static Sound CreateOriginalRadioLoop(int style) {
+    const unsigned int rate = 22050;
+    const float bpm = (style == 0) ? 112.0f : ((style == 1) ? 96.0f : 124.0f);
+    const float beat = 60.0f/bpm;
+    const unsigned int frames = (unsigned int)(rate*beat*16.0f);
+    short *pcm = (short *)MemAlloc(frames*sizeof(short));
+    if (pcm == NULL) return (Sound){0};
+    uint32_t noise = 0x51A7C3u;
+    const float bassNotes[3][4] = {
+        {55.0f, 65.41f, 73.42f, 82.41f},
+        {49.0f, 58.27f, 65.41f, 73.42f},
+        {61.74f, 73.42f, 82.41f, 92.50f}
+    };
+    const float leadNotes[3][8] = {
+        {440.0f, 523.25f, 493.88f, 587.33f, 392.0f, 440.0f, 523.25f, 659.25f},
+        {329.63f, 392.0f, 440.0f, 493.88f, 392.0f, 329.63f, 293.66f, 392.0f},
+        {493.88f, 587.33f, 659.25f, 783.99f, 659.25f, 587.33f, 523.25f, 659.25f}
+    };
+    if (style < 0 || style > 2) style = 0;
+    for (unsigned int i = 0; i < frames; i++) {
+        float t = (float)i/(float)rate;
+        float beatPos = fmodf(t, beat);
+        unsigned int beatIndex = (unsigned int)(t/beat);
+        unsigned int halfStep = (unsigned int)(t/(beat*0.5f));
+        float kickEnv = expf(-beatPos*18.0f);
+        float kick = ((beatIndex%4u)==0u || (beatIndex%4u)==2u) ?
+                     sinf(2.0f*PI_F*(47.0f - 13.0f*beatPos)*beatPos)*kickEnv*0.62f : 0.0f;
+        float snareEnv = expf(-beatPos*12.0f);
+        noise = noise*1664525u + 1013904223u;
+        float n = ((float)((noise>>8)&65535u)/32767.5f)-1.0f;
+        float snare = ((beatIndex%4u)==1u || (beatIndex%4u)==3u) ? n*snareEnv*0.11f : 0.0f;
+        float hat = ((halfStep%2u)==1u) ? n*0.035f*expf(-fmodf(t,beat*0.5f)*38.0f) : 0.0f;
+        unsigned int bar = (beatIndex/4u)%4u;
+        float bass = sinf(2.0f*PI_F*bassNotes[style][bar]*t)*0.18f;
+        unsigned int note = (unsigned int)(t/(beat*0.5f))%8u;
+        float leadEnv = 0.35f + 0.65f*expf(-fmodf(t,beat*0.5f)*2.4f);
+        float lead = (sinf(2.0f*PI_F*leadNotes[style][note]*t) +
+                      0.35f*sinf(4.0f*PI_F*leadNotes[style][note]*t))*0.055f*leadEnv;
+        float pad = (sinf(2.0f*PI_F*(bassNotes[style][0]*2.0f + (float)bar*13.0f)*t) +
+                     sinf(2.0f*PI_F*(bassNotes[style][2]*3.0f + (float)bar*9.0f)*t))*0.035f;
+        float sample = ClampF(kick + snare + hat + bass + lead + pad, -0.92f, 0.92f);
+        pcm[i] = (short)(sample*32767.0f);
+    }
+    Wave wave = {frames, rate, 16, 1, pcm};
+    Sound result = LoadSoundFromWave(wave);
+    UnloadWave(wave);
+    return result;
+}
+
+static Sound CreateEngineLoop(void) {
+    const unsigned int rate = 22050;
+    const unsigned int frames = rate*2u;
+    short *pcm = (short *)MemAlloc(frames*sizeof(short));
+    if (pcm == NULL) return (Sound){0};
+    for (unsigned int i = 0; i < frames; i++) {
+        float t = (float)i/(float)rate;
+        float envelope = 0.65f + 0.35f*sinf(2.0f*PI_F*t*3.0f);
+        float engine = sinf(2.0f*PI_F*58.0f*t) + 0.35f*sinf(2.0f*PI_F*116.0f*t);
+        float pulse = 0.16f*sinf(2.0f*PI_F*19.0f*t);
+        pcm[i] = (short)(ClampF((engine*0.12f + pulse)*envelope, -0.7f, 0.7f)*32767.0f);
+    }
+    Wave wave = {frames, rate, 16, 1, pcm};
+    Sound result = LoadSoundFromWave(wave);
+    UnloadWave(wave);
+    return result;
+}
+
+static void UpdateAudio(bool inCar, float speed, bool radioEnabled) {
+    if (!gAudioReady) return;
+    if (radioEnabled) {
+        if (!IsSoundPlaying(gRadioSounds[gRadioIndex])) PlaySound(gRadioSounds[gRadioIndex]);
+    } else if (IsSoundPlaying(gRadioSounds[gRadioIndex])) StopSound(gRadioSounds[gRadioIndex]);
+    if (inCar && fabsf(speed) > 0.8f) {
+        if (!IsSoundPlaying(gEngineSound)) PlaySound(gEngineSound);
+        SetSoundPitch(gEngineSound, 0.78f + ClampF(fabsf(speed)/38.0f, 0.0f, 1.0f)*0.85f);
+        SetSoundVolume(gEngineSound, 0.12f);
+    } else if (IsSoundPlaying(gEngineSound)) {
+        StopSound(gEngineSound);
+    }
+}
+
 /* ---- Main game --------------------------------------------------------- */
 int main(void) {
     SetConfigFlags(FLAG_MSAA_4X_HINT);
-    InitWindow(1280, 720, "CITY LIFE 3D - NOVA BAY");
+    InitWindow(1280, 720, "CITY LIFE 3D - NOVA BAY MEGA WORLD");
     SetTargetFPS(60);
+
+    InitAudioDevice();
+    gAudioDeviceReady = IsAudioDeviceReady();
+    gAudioReady = gAudioDeviceReady;
+    if (gAudioDeviceReady) {
+        for (int track = 0; track < 3; track++) {
+            gRadioSounds[track] = CreateOriginalRadioLoop(track);
+            if (IsSoundValid(gRadioSounds[track])) SetSoundVolume(gRadioSounds[track], 0.22f);
+        }
+        gEngineSound = CreateEngineLoop();
+        bool tracksReady = IsSoundValid(gRadioSounds[0]) && IsSoundValid(gRadioSounds[1]) &&
+                           IsSoundValid(gRadioSounds[2]) && IsSoundValid(gEngineSound);
+        gAudioReady = tracksReady;
+        if (gAudioReady) SetSoundVolume(gEngineSound, 0.12f);
+    }
+    gRadioEnabled = gAudioReady;
 
     BuildCity();
     InitPedestrians();
@@ -831,11 +1171,15 @@ int main(void) {
     float jumpVelocity = 0.0f;
     bool grounded = true;
     bool inCar = false;
+    int cameraMode = 0;
     int cash = 0;
     int missionStep = 0;
     int delivered = 0;
     float messageTimer = 0.0f;
-    char message[96] = "WELCOME TO NOVA BAY";
+    float driftComboTimer = 0.0f;
+    bool raining = false;
+    float weatherTimer = 0.0f;
+    char message[96] = "WELCOME TO NOVA BAY MEGA WORLD";
 
     Vector3 player = { 0.0f, 0.0f, 12.0f };
     float playerYaw = 0.0f;
@@ -857,10 +1201,23 @@ int main(void) {
     bool startWasDown = false;
     bool resumeWasDown = false;
     bool restartWasDown = false;
+    bool radioWasDown = false;
+    bool garageWasDown = false;
+    bool muteWasDown = false;
+    static const Color playerPaints[8] = {
+        {206, 58, 67, 255}, {46, 106, 186, 255}, {71, 134, 102, 255},
+        {198, 151, 65, 255}, {220, 224, 229, 255}, {80, 94, 115, 255},
+        {65, 58, 52, 255}, {224, 192, 54, 255}
+    };
 
     while (!WindowShouldClose()) {
         float dt = ClampF(GetFrameTime(), 0.0f, 0.045f);
         worldTime += dt;
+        float dayPhase = fmodf(worldTime, 240.0f)/240.0f;
+        float daylight = 0.5f + 0.5f*cosf(dayPhase*2.0f*PI_F);
+        gNightAmount = 1.0f - daylight;
+        weatherTimer += dt;
+        if (weatherTimer > 95.0f) { raining = !raining; weatherTimer = 0.0f; }
         int screenW = GetScreenWidth();
         int screenH = GetScreenHeight();
 
@@ -869,7 +1226,11 @@ int main(void) {
         Rectangle gasRect = {(float)screenW - 112.0f, (float)screenH - 144.0f, 94.0f, 82.0f};
         Rectangle brakeRect = {(float)screenW - 218.0f, (float)screenH - 132.0f, 94.0f, 72.0f};
         Rectangle sprintRect = {18.0f, (float)screenH - 118.0f, 90.0f, 48.0f};
-        Rectangle pauseRect = {(float)screenW - 54.0f, 218.0f, 40.0f, 38.0f};
+        Rectangle pauseRect = {(float)screenW - 54.0f, 304.0f, 40.0f, 38.0f};
+        Rectangle radioRect = {(float)screenW - 160.0f, 216.0f, 146.0f, 38.0f};
+        Rectangle garageRect = {(float)screenW - 160.0f, 260.0f, 146.0f, 38.0f};
+        Rectangle muteRect = {(float)screenW - 108.0f, 304.0f, 48.0f, 38.0f};
+        Rectangle driftRect = {(float)screenW - 218.0f, (float)screenH - 216.0f, 94.0f, 56.0f};
         Rectangle playRect = {(float)screenW*0.5f - 128.0f, (float)screenH*0.62f, 256.0f, 66.0f};
         Rectangle resumeRect = {(float)screenW*0.5f - 115.0f, (float)screenH*0.53f, 230.0f, 58.0f};
         Rectangle restartRect = {(float)screenW*0.5f - 115.0f, (float)screenH*0.63f, 230.0f, 58.0f};
@@ -904,6 +1265,21 @@ int main(void) {
             bool pausePressed = pauseDown && !pauseWasDown;
             pauseWasDown = pauseDown;
             if (pausePressed) state = GAME_PAUSED;
+            if (TouchPressed(radioRect, &radioWasDown)) {
+                if (gAudioReady && IsSoundPlaying(gRadioSounds[gRadioIndex])) StopSound(gRadioSounds[gRadioIndex]);
+                gRadioIndex = (gRadioIndex + 1)%3;
+                gRadioEnabled = true;
+                snprintf(message, sizeof(message), "RADIO: %s",
+                         (gRadioIndex == 0) ? "NOVA DRIFT" : ((gRadioIndex == 1) ? "NIGHT CRUISE" : "COASTLINE DRIVE"));
+                messageTimer = 2.0f;
+            }
+            if (TouchPressed(muteRect, &muteWasDown) || IsKeyPressed(KEY_M)) gRadioEnabled = !gRadioEnabled;
+            if (TouchPressed(garageRect, &garageWasDown) || IsKeyPressed(KEY_C)) {
+                playerCar.model = (playerCar.model + 1)%8;
+                playerCar.paint = playerPaints[playerCar.model];
+                snprintf(message, sizeof(message), "GARAGE: %s", GetCarName(playerCar.model));
+                messageTimer = 2.0f;
+            }
         }
 
         Vector3 actor = inCar ? playerCar.position : player;
@@ -920,6 +1296,8 @@ int main(void) {
         bool gasDown = false;
         bool brakeDown = false;
         bool sprintDown = false;
+        bool nitroDown = false;
+        bool handbrakeDown = false;
         bool jumpPressed = false;
         bool actionPressed = false;
 
@@ -947,6 +1325,8 @@ int main(void) {
             gasDown = TouchHeld(gasRect) || IsKeyDown(KEY_LEFT_SHIFT);
             brakeDown = TouchHeld(brakeRect) || IsKeyDown(KEY_SPACE);
             sprintDown = !inCar && (TouchHeld(sprintRect) || IsKeyDown(KEY_LEFT_CONTROL));
+            nitroDown = inCar && (TouchHeld(sprintRect) || IsKeyDown(KEY_N));
+            handbrakeDown = inCar && (TouchHeld(driftRect) || IsKeyDown(KEY_LEFT_ALT));
             jumpPressed = TouchPressed(jumpRect, &jumpWasDown) || IsKeyPressed(KEY_SPACE);
             actionPressed = TouchPressed(actionRect, &actionWasDown) || IsKeyPressed(KEY_E);
 
@@ -956,6 +1336,7 @@ int main(void) {
             if (!inCar) {
                 if (actionPressed && nearCar) {
                     inCar = true;
+                    cameraMode = 0;
                     playerCar.position = player;
                     playerCar.position.y = 0.0f;
                     playerCar.yaw = playerYaw;
@@ -998,6 +1379,11 @@ int main(void) {
                     grounded = true;
                 }
             } else {
+                if (jumpPressed) {
+                    cameraMode = (cameraMode + 1)%3;
+                    snprintf(message, sizeof(message), "CAMERA MODE %d / 3", cameraMode + 1);
+                    messageTimer = 1.2f;
+                }
                 if (actionPressed) {
                     inCar = false;
                     playerCar.speed = 0.0f;
@@ -1017,17 +1403,32 @@ int main(void) {
                     if (gasDown) throttle = 1.0f;
                     if (brakeDown) throttle = -0.50f;
 
-                    playerCar.speed += throttle*13.5f*dt;
+                    playerCar.speed += throttle*(nitroDown ? 23.0f : 14.5f)*dt;
                     if (!gasDown && !brakeDown && fabsf(stick.y) < 0.05f) {
-                        playerCar.speed *= (1.0f - ClampF(1.12f*dt, 0.0f, 0.9f));
+                        playerCar.speed *= (1.0f - ClampF((handbrakeDown ? 0.48f : 0.86f)*dt, 0.0f, 0.9f));
                     }
                     if (brakeDown) {
-                        if (playerCar.speed > 0.0f) playerCar.speed = fmaxf(0.0f, playerCar.speed - 25.0f*dt);
-                        else playerCar.speed = fminf(0.0f, playerCar.speed + 25.0f*dt);
+                        if (playerCar.speed > 0.0f) playerCar.speed = fmaxf(0.0f, playerCar.speed - 26.0f*dt);
+                        else playerCar.speed = fminf(0.0f, playerCar.speed + 26.0f*dt);
                     }
-                    playerCar.speed = ClampF(playerCar.speed, -7.5f, 25.0f);
-                    float turn = stick.x*1.55f*ClampF(fabsf(playerCar.speed)/4.0f, 0.18f, 1.1f)*dt;
+                    playerCar.speed = ClampF(playerCar.speed, -9.0f, nitroDown ? 54.0f : 39.0f);
+                    float steerRate = handbrakeDown ? 2.45f : 1.68f;
+                    float turn = stick.x*steerRate*ClampF(fabsf(playerCar.speed)/4.0f, 0.18f, 1.15f)*dt;
                     playerCar.yaw = NormalizeAngle(playerCar.yaw - turn*(playerCar.speed < 0.0f ? -1.0f : 1.0f));
+                    bool driftingNow = handbrakeDown && fabsf(playerCar.speed) > 8.0f && fabsf(stick.x) > 0.12f;
+                    if (driftingNow) {
+                        gDriftScore += fabsf(playerCar.speed)*fabsf(stick.x)*dt*4.3f;
+                        driftComboTimer = 1.25f;
+                        gSmokeSpawnTimer += dt;
+                        if (gSmokeSpawnTimer > 0.065f) { SpawnDriftEffects(&playerCar); gSmokeSpawnTimer = 0.0f; }
+                    } else {
+                        if (driftComboTimer > 0.0f) driftComboTimer -= dt;
+                        else if (gDriftScore > 0.0f) {
+                            if ((int)gDriftScore > gBestDrift) gBestDrift = (int)gDriftScore;
+                            cash += (int)(gDriftScore/35.0f);
+                            gDriftScore = 0.0f;
+                        }
+                    }
 
                     float dx = -sinf(playerCar.yaw)*playerCar.speed*dt;
                     float dz = -cosf(playerCar.yaw)*playerCar.speed*dt;
@@ -1045,17 +1446,22 @@ int main(void) {
 
             UpdateTraffic(dt);
             UpdatePedestrians(dt);
+            UpdateDriftEffects(dt);
             if (messageTimer > 0.0f) messageTimer -= dt;
         }
+        UpdateAudio(inCar, playerCar.speed, gRadioEnabled);
 
         /* Camera follows smoothly behind the player or vehicle. */
         actor = inCar ? playerCar.position : player;
         float actorYaw = inCar ? playerCar.yaw : playerYaw;
         Vector3 desiredTarget = { actor.x, actor.y + (inCar ? 1.35f : 1.35f), actor.z };
+        float cameraBack = inCar ? ((cameraMode == 1) ? 17.0f :
+                                    ((cameraMode == 2) ? 6.2f : 10.8f)) : 10.6f;
+        if (inCar && cameraMode == 0) cameraBack += ClampF(fabsf(playerCar.speed)*0.075f, 0.0f, 3.4f);
         Vector3 desiredCamera = {
-            actor.x + sinf(actorYaw)*10.6f,
-            actor.y + 6.7f,
-            actor.z + cosf(actorYaw)*10.6f
+            actor.x + sinf(actorYaw)*cameraBack,
+            actor.y + (inCar ? ((cameraMode == 1) ? 8.2f : ((cameraMode == 2) ? 3.4f : 6.1f)) : 6.7f),
+            actor.z + cosf(actorYaw)*cameraBack
         };
         if (state == GAME_TITLE) {
             desiredTarget = (Vector3){ 0.0f, 2.0f, 8.0f };
@@ -1070,11 +1476,13 @@ int main(void) {
 
         /* ---- Render 3D world ------------------------------------------- */
         BeginDrawing();
-        ClearBackground(C_SKY);
+        Color sky = LerpColor((Color){9, 16, 34, 255}, C_SKY, daylight);
+        ClearBackground(sky);
         BeginMode3D(camera);
 
-        DrawRoadNetwork();
+        DrawRoadNetwork(actor);
         DrawCentralPlaza(worldTime);
+        DrawWorldLandmarks(actor, worldTime);
 
         /* Buildings are distance-culled around the current actor. */
         for (int i = 0; i < gBuildingCount; i++) {
@@ -1134,9 +1542,16 @@ int main(void) {
                               (missionStep%2) == 0);
         }
 
-        /* Sun and distant horizon landmark. */
-        DrawSphere((Vector3){ -115.0f, 82.0f, -160.0f }, 7.0f,
-                   (Color){ 255, 224, 158, 255 });
+        /* Sun/moon, tyre effects and local weather. */
+        if (daylight > 0.22f) {
+            DrawSphere((Vector3){actor.x - 100.0f, 72.0f, actor.z - 145.0f}, 7.0f,
+                       (Color){255, 226, 166, 255});
+        } else {
+            DrawSphere((Vector3){actor.x + 110.0f, 78.0f, actor.z - 135.0f}, 5.3f,
+                       (Color){218, 229, 244, 255});
+        }
+        DrawDriftEffects();
+        DrawRainAround(actor, worldTime, raining);
         EndMode3D();
 
         /* ---- Render 2D interface -------------------------------------- */
@@ -1157,14 +1572,19 @@ int main(void) {
                      (int)(playRect.y + 82.0f), 14, Fade(C_WHITE, 0.82f));
             DrawText("TOUCH THE BUTTON TO PLAY",
                      screenW/2 - MeasureText("TOUCH THE BUTTON TO PLAY", 13)/2,
-                     screenH - 34, 13, Fade(C_WHITE, 0.72f));
+                     screenH - 54, 13, Fade(C_WHITE, 0.72f));
+            DrawText(gAudioReady ? "3 ORIGINAL NOVA FM TRACKS  |  DAY / NIGHT / RAIN" : "AUDIO NOT AVAILABLE ON THIS DEVICE",
+                     screenW/2 - MeasureText(gAudioReady ? "3 ORIGINAL NOVA FM TRACKS  |  DAY / NIGHT / RAIN" : "AUDIO NOT AVAILABLE ON THIS DEVICE", 11)/2,
+                     screenH - 32, 11, Fade(C_MINT, 0.85f));
         } else {
             DrawGameHUD(screenW, screenH, cash, delivered, missionStep,
                         playerCar.speed, inCar, nearCar, nearMission,
                         actor, missionTarget, hasTarget,
-                        stick, stickX, stickY, worldTime);
+                        stick, stickX, stickY, worldTime, gRadioEnabled, gRadioIndex,
+                        playerCar.model, gDriftScore, gBestDrift, gNightAmount, raining);
 
             DrawButton(pauseRect, "II", (Color){ 58, 73, 91, 255 }, false);
+            DrawButton(muteRect, gRadioEnabled ? "FM" : "OFF", (Color){ 62, 90, 112, 255 }, false);
 
             if (messageTimer > 0.0f) {
                 Rectangle mr = {(float)screenW*0.5f - 190.0f,
@@ -1184,15 +1604,28 @@ int main(void) {
                          (int)((float)screenH*0.5f - 112.0f), 32, C_WHITE);
                 DrawButton(resumeRect, "RESUME", (Color){ 36, 139, 94, 255 }, true);
                 DrawButton(restartRect, "RESTART CITY", (Color){ 55, 99, 153, 255 }, false);
-                DrawText("YOUR PROGRESS IS KEPT WHILE THE APP IS OPEN",
-                         screenW/2 - MeasureText("YOUR PROGRESS IS KEPT WHILE THE APP IS OPEN", 11)/2,
-                         (int)((float)screenH*0.5f + 103.0f), 11, Fade(C_WHITE, 0.72f));
+                DrawText("24-HOUR WORLD  |  DRIFT  |  GARAGE  |  ORIGINAL RADIO",
+                         screenW/2 - MeasureText("24-HOUR WORLD  |  DRIFT  |  GARAGE  |  ORIGINAL RADIO", 10)/2,
+                         (int)((float)screenH*0.5f + 103.0f), 10, Fade(C_WHITE, 0.72f));
             }
         }
 
         EndDrawing();
     }
 
+    if (gAudioDeviceReady) {
+        for (int track = 0; track < 3; track++) {
+            if (IsSoundValid(gRadioSounds[track])) {
+                StopSound(gRadioSounds[track]);
+                UnloadSound(gRadioSounds[track]);
+            }
+        }
+        if (IsSoundValid(gEngineSound)) {
+            StopSound(gEngineSound);
+            UnloadSound(gEngineSound);
+        }
+        CloseAudioDevice();
+    }
     CloseWindow();
     return 0;
 }
