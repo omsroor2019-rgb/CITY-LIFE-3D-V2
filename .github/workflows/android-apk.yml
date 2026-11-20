@@ -95,7 +95,7 @@ jobs:
               "app.name": "CITY LIFE 3D",
               "app.native_library_name": "citylife3d",
               "app.application_id": "com.citylife3d.game",
-              "app.category": "GAME",
+              "app.category": "LAUNCHER", 
               "app.orientation": "landscape",
               "app.version_name": "0.3.0",
               "app.version_code": "3",
