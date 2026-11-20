@@ -97,8 +97,8 @@ jobs:
               "app.application_id": "com.citylife3d.game",
               "app.category": "GAME",
               "app.orientation": "landscape",
-              "app.version_name": "0.2.0",
-              "app.version_code": "2",
+              "app.version_name": "0.3.0",
+              "app.version_code": "3",
               "gl.version": "ES20",
               "display.keep_on": "true",
               "display.immersive": "true",
@@ -163,7 +163,7 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CITY-LIFE-3D-V2-APK
+          name: CITY-LIFE-3D-V3-MEGA-WORLD-APK
           path: android-project/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
