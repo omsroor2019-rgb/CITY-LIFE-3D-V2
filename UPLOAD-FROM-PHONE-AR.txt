@@ -1,0 +1,12 @@
+طريقة تحديث لعبتك من الهاتف
+
+1) حمّل CITY-LIFE-3D-V2-FULL-PROJECT.zip ثم فك ضغطه.
+2) في مستودع GitHub الحالي افتح src/main.c واضغط Edit، واستبدل محتواه بمحتوى src/main.c الجديد، ثم Commit changes.
+3) افتح .github/workflows/android-apk.yml واضغط Edit، واستبدل محتواه بمحتوى الملف الجديد، ثم Commit changes.
+4) لا تغيّر مسارات الملفات. يجب أن يبقى كود اللعبة في src/main.c وملف البناء في .github/workflows/android-apk.yml.
+5) بعد الحفظ يبدأ GitHub Actions تلقائياً على الفرع main. افتح More > Actions.
+6) عند نجاح Build Android APK نزّل Artifact باسم CITY-LIFE-3D-V2-APK.
+7) فك ضغط Artifact وثبّت app-debug.apk.
+8) إذا رفض Android تثبيت الإصدار الجديد فوق القديم بسبب اختلاف توقيع Debug، احذف النسخة القديمة أولاً ثم ثبّت الجديدة. حذف التطبيق القديم قد يمسح بياناته.
+
+لا ترفع ملف ZIP وحده على أنه كود المصدر. ارفع الملفات بعد فك الضغط مع الحفاظ على المسارات.
